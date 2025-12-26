@@ -58,9 +58,19 @@ class BluetoothConnection {
   /// Returns connection to given address.
   static Future<BluetoothConnection> toAddress(String? address) async {
     // Sorry for pseudo-factory, but `factory` keyword disallows `Future`.
-    return BluetoothConnection._consumeConnectionID(await FlutterBluetoothSerial
+    if (address == null || address.isEmpty) {
+      throw ArgumentError('Bluetooth address cannot be null or empty');
+    }
+
+    final dynamic connectionId = await FlutterBluetoothSerial
         ._methodChannel
-        .invokeMethod('connect', {"address": address}));
+        .invokeMethod('connect', {"address": address});
+
+    if (connectionId == null) {
+      throw StateError('Connection failed: native method returned null');
+    }
+
+    return BluetoothConnection._consumeConnectionID(connectionId as int);
   }
 
   /// Should be called to make sure the connection is closed and resources are freed (sockets/channels).
