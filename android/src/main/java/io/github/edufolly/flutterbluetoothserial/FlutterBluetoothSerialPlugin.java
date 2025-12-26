@@ -1060,6 +1060,94 @@ public class FlutterBluetoothSerialPlugin implements FlutterPlugin, ActivityAwar
                     break;
                 }
 
+                case "disconnect": {
+                    if (!call.hasArgument("id")) {
+                        result.error("invalid_argument", "argument 'id' not found", null);
+                        break;
+                    }
+
+                    int id;
+                    try {
+                        id = call.argument("id");
+                    } catch (ClassCastException ex) {
+                        result.error("invalid_argument", "'id' argument is required to be integer id of connection", null);
+                        break;
+                    }
+
+                    BluetoothConnection connection = connections.get(id);
+                    if (connection == null) {
+                        // Connection already removed, consider it success
+                        result.success(true);
+                        break;
+                    }
+
+                    Log.d(TAG, "Disconnecting connection id: " + id);
+                    AsyncTask.execute(() -> {
+                        try {
+                            connection.disconnect();
+                            connections.remove(id);
+                            activity.runOnUiThread(() -> result.success(true));
+                        } catch (Exception ex) {
+                            activity.runOnUiThread(() -> result.error("disconnect_error", ex.getMessage(), exceptionToString(ex)));
+                        }
+                    });
+                    break;
+                }
+
+                case "forceDisconnect": {
+                    if (!call.hasArgument("id")) {
+                        result.error("invalid_argument", "argument 'id' not found", null);
+                        break;
+                    }
+
+                    int id;
+                    try {
+                        id = call.argument("id");
+                    } catch (ClassCastException ex) {
+                        result.error("invalid_argument", "'id' argument is required to be integer id of connection", null);
+                        break;
+                    }
+
+                    BluetoothConnection connection = connections.get(id);
+                    if (connection == null) {
+                        // Connection already removed, consider it success
+                        result.success(true);
+                        break;
+                    }
+
+                    Log.d(TAG, "Force disconnecting connection id: " + id);
+                    AsyncTask.execute(() -> {
+                        try {
+                            connection.forceDisconnect();
+                            connections.remove(id);
+                            activity.runOnUiThread(() -> result.success(true));
+                        } catch (Exception ex) {
+                            activity.runOnUiThread(() -> result.error("force_disconnect_error", ex.getMessage(), exceptionToString(ex)));
+                        }
+                    });
+                    break;
+                }
+
+                case "disconnectAll": {
+                    Log.d(TAG, "Disconnecting all connections");
+                    AsyncTask.execute(() -> {
+                        int size = connections.size();
+                        for (int i = 0; i < size; i++) {
+                            try {
+                                BluetoothConnection conn = connections.valueAt(i);
+                                if (conn != null) {
+                                    conn.forceDisconnect();
+                                }
+                            } catch (Exception ex) {
+                                Log.w(TAG, "Error disconnecting connection: " + ex.getMessage());
+                            }
+                        }
+                        connections.clear();
+                        activity.runOnUiThread(() -> result.success(true));
+                    });
+                    break;
+                }
+
                 default:
                     result.notImplemented();
                     break;

@@ -88,6 +88,40 @@ class BluetoothConnection {
     await output.allSent;
     close();
   }
+
+  /// Force closes the connection immediately.
+  /// Use this when the device has gone out of range and normal close doesn't work.
+  /// This bypasses the graceful shutdown and immediately closes the socket.
+  Future<void> forceClose() async {
+    // Mark output as not connected to prevent further writes
+    output.isConnected = false;
+
+    // Cancel the read subscription
+    try {
+      await _readStreamSubscription.cancel();
+    } catch (e) {
+      // Ignore errors during force close
+    }
+
+    // Close the stream controller
+    if (!_readStreamController.isClosed) {
+      try {
+        await _readStreamController.close();
+      } catch (e) {
+        // Ignore errors during force close
+      }
+    }
+
+    // Call native force disconnect
+    if (_id != null) {
+      try {
+        await FlutterBluetoothSerial._methodChannel
+            .invokeMethod('forceDisconnect', {'id': _id});
+      } catch (e) {
+        // Ignore errors - connection might already be closed
+      }
+    }
+  }
 }
 
 /// Helper class for sending responses.

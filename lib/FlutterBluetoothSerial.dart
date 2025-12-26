@@ -281,4 +281,10 @@ class FlutterBluetoothSerial {
     _defaultConnection!.output.add(message);
     return _defaultConnection!.output.allSent;
   }
+
+  /// Force disconnects all active Bluetooth connections.
+  /// Use this when you need to ensure all connections are closed,
+  /// especially before attempting reconnection after device went out of range.
+  Future<bool?> disconnectAll() async =>
+      await _methodChannel.invokeMethod('disconnectAll');
 }

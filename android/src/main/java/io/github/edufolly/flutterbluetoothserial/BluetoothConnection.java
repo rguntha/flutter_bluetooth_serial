@@ -3,21 +3,30 @@ package io.github.edufolly.flutterbluetoothserial;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.util.UUID;
 import java.util.Arrays;
 
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
+import android.util.Log;
 
 /// Universal Bluetooth serial connection class (for Java)
 public abstract class BluetoothConnection
 {
+    private static final String TAG = "BluetoothConnection";
     protected static final UUID DEFAULT_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+
+    // Fallback RFCOMM channels to try if default method fails
+    private static final int[] FALLBACK_CHANNELS = {1, 2, 3, 4, 5};
 
     protected BluetoothAdapter bluetoothAdapter;
 
     protected ConnectionThread connectionThread = null;
+
+    // Track the socket separately for force close scenarios
+    protected BluetoothSocket currentSocket = null;
 
     public boolean isConnected() {
         return connectionThread != null && connectionThread.requestedClosing != true;
@@ -31,10 +40,6 @@ public abstract class BluetoothConnection
 
 
 
-    // @TODO . `connect` could be done perfored on the other thread
-    // @TODO . `connect` parameter: timeout
-    // @TODO . `connect` other methods than `createRfcommSocketToServiceRecord`, including hidden one raw `createRfcommSocket` (on channel).
-    // @TODO ? how about turning it into factoried?
     /// Connects to given device by hardware address
     public void connect(String address, UUID uuid) throws IOException {
         if (isConnected()) {
@@ -46,19 +51,73 @@ public abstract class BluetoothConnection
             throw new IOException("device not found");
         }
 
-        BluetoothSocket socket = device.createRfcommSocketToServiceRecord(uuid); // @TODO . introduce ConnectionMethod
-        if (socket == null) {
-            throw new IOException("socket connection not established");
-        }
-
-        // Cancel discovery, even though we didn't start it
+        // Cancel discovery before attempting to connect
         bluetoothAdapter.cancelDiscovery();
 
-        socket.connect();
+        BluetoothSocket socket = null;
+        IOException lastException = null;
 
+        // First, try the standard method
+        try {
+            Log.d(TAG, "Attempting connection using createRfcommSocketToServiceRecord");
+            socket = device.createRfcommSocketToServiceRecord(uuid);
+            if (socket != null) {
+                socket.connect();
+                Log.d(TAG, "Connected successfully using standard method");
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "Standard connection method failed: " + e.getMessage());
+            lastException = e;
+            socket = null;
+        }
+
+        // If standard method failed, try reflection-based fallback
+        if (socket == null || !socket.isConnected()) {
+            if (socket != null) {
+                try { socket.close(); } catch (Exception ignored) {}
+            }
+
+            for (int channel : FALLBACK_CHANNELS) {
+                try {
+                    Log.d(TAG, "Attempting fallback connection on channel " + channel);
+                    socket = createRfcommSocketByReflection(device, channel);
+                    if (socket != null) {
+                        socket.connect();
+                        if (socket.isConnected()) {
+                            Log.d(TAG, "Connected successfully using fallback on channel " + channel);
+                            break;
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Fallback connection on channel " + channel + " failed: " + e.getMessage());
+                    lastException = new IOException("Fallback connection failed", e);
+                    if (socket != null) {
+                        try { socket.close(); } catch (Exception ignored) {}
+                    }
+                    socket = null;
+                }
+            }
+        }
+
+        if (socket == null || !socket.isConnected()) {
+            throw lastException != null ? lastException : new IOException("socket connection not established");
+        }
+
+        currentSocket = socket;
         connectionThread = new ConnectionThread(socket);
         connectionThread.start();
     }
+
+    /// Creates an RFCOMM socket using reflection (fallback method)
+    private BluetoothSocket createRfcommSocketByReflection(BluetoothDevice device, int channel) throws IOException {
+        try {
+            Method method = device.getClass().getMethod("createRfcommSocket", new Class[] { int.class });
+            return (BluetoothSocket) method.invoke(device, channel);
+        } catch (Exception e) {
+            throw new IOException("Failed to create socket via reflection: " + e.getMessage(), e);
+        }
+    }
+
     /// Connects to given device by hardware address (default UUID used)
     public void connect(String address) throws IOException {
         connect(address, DEFAULT_UUID);
@@ -66,10 +125,37 @@ public abstract class BluetoothConnection
     
     /// Disconnects current session (ignore if not connected)
     public void disconnect() {
-        if (isConnected()) {
+        Log.d(TAG, "Disconnecting...");
+        if (connectionThread != null) {
             connectionThread.cancel();
             connectionThread = null;
         }
+        currentSocket = null;
+        Log.d(TAG, "Disconnected");
+    }
+
+    /// Force disconnects by closing the socket directly
+    /// Use this when normal disconnect doesn't work (e.g., device went out of range)
+    public void forceDisconnect() {
+        Log.d(TAG, "Force disconnecting...");
+
+        // First, close the socket directly to unblock any pending I/O
+        if (currentSocket != null) {
+            try {
+                currentSocket.close();
+            } catch (Exception e) {
+                Log.w(TAG, "Error closing socket during force disconnect: " + e.getMessage());
+            }
+            currentSocket = null;
+        }
+
+        // Then clean up the thread
+        if (connectionThread != null) {
+            connectionThread.forceCancel();
+            connectionThread = null;
+        }
+
+        Log.d(TAG, "Force disconnected");
     }
 
     /// Writes to connected remote device 
@@ -92,8 +178,8 @@ public abstract class BluetoothConnection
         private final BluetoothSocket socket;
         private final InputStream input;
         private final OutputStream output;
-        private boolean requestedClosing = false;
-        
+        private volatile boolean requestedClosing = false;
+
         ConnectionThread(BluetoothSocket socket) {
             this.socket = socket;
             InputStream tmpIn = null;
@@ -103,6 +189,7 @@ public abstract class BluetoothConnection
                 tmpIn = socket.getInputStream();
                 tmpOut = socket.getOutputStream();
             } catch (IOException e) {
+                Log.e(TAG, "Error getting streams: " + e.getMessage());
                 e.printStackTrace();
             }
 
@@ -115,37 +202,68 @@ public abstract class BluetoothConnection
             byte[] buffer = new byte[1024];
             int bytes;
 
+            Log.d(TAG, "ConnectionThread started");
+
             while (!requestedClosing) {
                 try {
                     bytes = input.read(buffer);
-
+                    if (bytes == -1) {
+                        // End of stream - remote device closed connection
+                        Log.d(TAG, "End of stream reached");
+                        break;
+                    }
                     onRead(Arrays.copyOf(buffer, bytes));
                 } catch (IOException e) {
-                    // `input.read` throws when closed by remote device
+                    // `input.read` throws when closed by remote device or socket is closed
+                    Log.d(TAG, "Read exception (connection likely closed): " + e.getMessage());
                     break;
                 }
             }
 
-            // Make sure output stream is closed
-            if (output != null) {
-                try {
-                    output.close();
-                }
-                catch (Exception e) {}
-            }
+            Log.d(TAG, "ConnectionThread exiting read loop, cleaning up...");
 
-            // Make sure input stream is closed
+            // Close streams in the correct order:
+            // 1. Close input stream first to unblock any pending reads
             if (input != null) {
                 try {
                     input.close();
+                    Log.d(TAG, "Input stream closed");
+                } catch (Exception e) {
+                    Log.w(TAG, "Error closing input stream: " + e.getMessage());
                 }
-                catch (Exception e) {}
+            }
+
+            // 2. Flush and close output stream
+            if (output != null) {
+                try {
+                    output.flush();
+                } catch (Exception e) {
+                    Log.w(TAG, "Error flushing output stream: " + e.getMessage());
+                }
+                try {
+                    output.close();
+                    Log.d(TAG, "Output stream closed");
+                } catch (Exception e) {
+                    Log.w(TAG, "Error closing output stream: " + e.getMessage());
+                }
+            }
+
+            // 3. Close socket
+            if (socket != null) {
+                try {
+                    socket.close();
+                    Log.d(TAG, "Socket closed");
+                } catch (Exception e) {
+                    Log.w(TAG, "Error closing socket: " + e.getMessage());
+                }
             }
 
             // Callback on disconnected, with information which side is closing
-            onDisconnected(!requestedClosing);
+            boolean byRemote = !requestedClosing;
+            Log.d(TAG, "Calling onDisconnected, byRemote=" + byRemote);
+            onDisconnected(byRemote);
 
-            // Just prevent unnecessary `cancel`ing
+            // Mark as closed
             requestedClosing = true;
         }
 
@@ -154,32 +272,61 @@ public abstract class BluetoothConnection
             try {
                 output.write(bytes);
             } catch (IOException e) {
+                Log.e(TAG, "Write error: " + e.getMessage());
                 e.printStackTrace();
             }
         }
 
-        /// Stops the thread, disconnects
+        /// Stops the thread, disconnects gracefully
         public void cancel() {
             if (requestedClosing) {
+                Log.d(TAG, "Already closing, skipping cancel");
                 return;
             }
             requestedClosing = true;
+            Log.d(TAG, "Cancel requested");
 
-            // Flush output buffers befoce closing
-            try {
-                output.flush();
+            // Flush output buffers before closing
+            if (output != null) {
+                try {
+                    output.flush();
+                } catch (Exception e) {
+                    Log.w(TAG, "Error flushing during cancel: " + e.getMessage());
+                }
             }
-            catch (Exception e) {}
 
-            // Close the connection socket
+            // Close the connection socket with a longer delay to ensure cleanup
             if (socket != null) {
                 try {
-                    // Might be useful (see https://stackoverflow.com/a/22769260/4880243)
-                    Thread.sleep(111);
-
+                    // Give time for data to be sent and Bluetooth stack to process
+                    Thread.sleep(500);
                     socket.close();
+                    Log.d(TAG, "Socket closed during cancel");
+                } catch (Exception e) {
+                    Log.w(TAG, "Error closing socket during cancel: " + e.getMessage());
                 }
-                catch (Exception e) {}
+            }
+        }
+
+        /// Force cancels the thread without waiting
+        public void forceCancel() {
+            Log.d(TAG, "Force cancel requested");
+            requestedClosing = true;
+
+            // Close socket immediately to unblock I/O
+            if (socket != null) {
+                try {
+                    socket.close();
+                } catch (Exception e) {
+                    Log.w(TAG, "Error closing socket during force cancel: " + e.getMessage());
+                }
+            }
+
+            // Interrupt the thread if it's blocked
+            try {
+                this.interrupt();
+            } catch (Exception e) {
+                Log.w(TAG, "Error interrupting thread: " + e.getMessage());
             }
         }
     }
