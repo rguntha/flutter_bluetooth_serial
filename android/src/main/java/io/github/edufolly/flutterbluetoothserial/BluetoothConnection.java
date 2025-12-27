@@ -68,6 +68,10 @@ public abstract class BluetoothConnection
         } catch (IOException e) {
             Log.w(TAG, "Standard connection method failed: " + e.getMessage());
             lastException = e;
+            // Close the socket if it was created before setting to null
+            if (socket != null) {
+                try { socket.close(); } catch (Exception ignored) {}
+            }
             socket = null;
         }
 
@@ -86,6 +90,11 @@ public abstract class BluetoothConnection
                         if (socket.isConnected()) {
                             Log.d(TAG, "Connected successfully using fallback on channel " + channel);
                             break;
+                        } else {
+                            // Socket created but not connected - close it
+                            Log.w(TAG, "Socket created on channel " + channel + " but not connected, closing");
+                            try { socket.close(); } catch (Exception ignored) {}
+                            socket = null;
                         }
                     }
                 } catch (Exception e) {
